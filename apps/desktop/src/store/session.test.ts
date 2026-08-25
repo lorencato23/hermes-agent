@@ -989,3 +989,132 @@ describe('knownSessionProfile', () => {
     expect(knownSessionProfile([], null)).toBeUndefined()
   })
 })
+
+describe('knownSessionOwner reconciliation', () => {
+  it('reconciles a complete hint with same-profile profile-only evidence', () => {
+    const hint = {
+      connectionId: 'remote-source',
+      mode: 'remote' as const,
+      profile: 'default',
+      targetProfile: 'backend-default'
+    }
+
+    setSessionOwnerHint('partial-confirmation', hint)
+
+    expect(
+      knownSessionOwner([session({ id: 'partial-confirmation', profile: 'default' })], 'partial-confirmation')
+    ).toEqual(hint)
+  })
+
+  it('reconciles a qualified row with a same-profile profile-only row', () => {
+    expect(
+      knownSessionOwner(
+        [
+          session({ connection_id: 'source-a', id: 'compatible-rows', profile: 'worker' }),
+          session({ connection_id: undefined, id: 'compatible-rows', profile: 'worker' })
+        ],
+        'compatible-rows'
+      )
+    ).toEqual({ connectionId: 'source-a', profile: 'worker' })
+  })
+
+  it('fails closed for contradictory connection-qualified owners', () => {
+    setSessionOwnerHint('contradictory-connections', { connectionId: 'source-a', profile: 'worker' })
+
+    expect(
+      knownSessionOwner(
+        [session({ connection_id: 'source-b', id: 'contradictory-connections', profile: 'worker' })],
+        'contradictory-connections'
+      )
+    ).toEqual({ ambiguous: true })
+  })
+
+  it('fails closed when profile-only evidence contradicts the qualified owner', () => {
+    setSessionOwnerHint('contradictory-profiles', { connectionId: 'source-a', profile: 'worker' })
+
+    expect(
+      knownSessionOwner([session({ id: 'contradictory-profiles', profile: 'reviewer' })], 'contradictory-profiles')
+    ).toEqual({ ambiguous: true })
+  })
+
+  it('ignores profileless rows instead of inventing default ownership', () => {
+    expect(
+      knownSessionOwner(
+        [session({ connection_id: 'source-profileless', id: 'profileless-row', profile: undefined })],
+        'profileless-row'
+      )
+    ).toBeUndefined()
+  })
+
+  // The cross-profile aggregator tags each row with the profile the BACKEND
+  // stores, which for a routed agent is the route's targetProfile — not the
+  // local `profile` key the route dials on. Reading those two projections as
+  // two different owners failed exactly the routed sessions this resolver
+  // protects, closed, the moment their row landed.
+  it('accepts a row carrying the route targetProfile as the same owner', () => {
+    const hint = {
+      connectionId: 'barry',
+      mode: 'remote' as const,
+      profile: 'oxcoder',
+      targetProfile: 'backend-oxcoder'
+    }
+
+    setSessionOwnerHint('target-profile-row', hint)
+
+    expect(
+      knownSessionOwner(
+        [session({ connection_id: 'barry', id: 'target-profile-row', profile: 'backend-oxcoder' })],
+        'target-profile-row'
+      )
+    ).toEqual(hint)
+  })
+
+  it('accepts profile-only evidence naming the route targetProfile', () => {
+    const hint = {
+      connectionId: 'barry',
+      mode: 'remote' as const,
+      profile: 'oxcoder',
+      targetProfile: 'backend-oxcoder'
+    }
+
+    setSessionOwnerHint('target-profile-projection', hint)
+
+    expect(
+      knownSessionOwner(
+        [session({ id: 'target-profile-projection', profile: 'backend-oxcoder' })],
+        'target-profile-projection'
+      )
+    ).toEqual(hint)
+  })
+
+  it('fails closed for two hints claiming different connections', () => {
+    setSessionOwnerHint('two-hint-connections', { connectionId: 'source-a', profile: 'worker' })
+    setSessionOwnerHint('two-hint-connections', { connectionId: 'source-b', profile: 'worker' })
+
+    expect(knownSessionOwner([], 'two-hint-connections')).toEqual({ ambiguous: true })
+  })
+
+  it('fails closed for two rows on different connections', () => {
+    expect(
+      knownSessionOwner(
+        [
+          session({ connection_id: 'source-a', id: 'two-row-connections', profile: 'worker' }),
+          session({ connection_id: 'source-b', id: 'two-row-connections', profile: 'worker' })
+        ],
+        'two-row-connections'
+      )
+    ).toEqual({ ambiguous: true })
+  })
+
+  it('fails closed for contradictory profile-only projections', () => {
+    expect(
+      knownSessionOwner(
+        [
+          session({ id: 'two-bare-profiles', profile: 'worker' }),
+          session({ id: 'two-bare-profiles', profile: 'reviewer' })
+        ],
+        'two-bare-profiles'
+      )
+    ).toEqual({ ambiguous: true })
+  })
+})

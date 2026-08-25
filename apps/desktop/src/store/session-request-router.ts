@@ -7,7 +7,18 @@ export interface SessionProfileRoute {
   targetProfile?: string
 }
 
-export type SessionOwnerScope = undefined | null | string | SessionProfileRoute
+export interface AmbiguousSessionOwner {
+  ambiguous: true
+}
+
+/**
+ * The one ambiguous-owner value. Owner resolution returns THIS object rather
+ * than a fresh literal so the sentinel stays allocation-free on the per-RPC
+ * dispatch path and callers may compare it by identity.
+ */
+export const AMBIGUOUS_SESSION_OWNER: AmbiguousSessionOwner = Object.freeze({ ambiguous: true })
+
+export type SessionOwnerScope = undefined | null | string | AmbiguousSessionOwner | SessionProfileRoute
 
 // ── Session-scoped RPC routing (the #89206 class) ───────────────────────────
 // A session-scoped RPC (session.resume / session.activate / session.usage /
@@ -32,6 +43,14 @@ const normKey = (profile: null | string | undefined): string => (profile ?? '').
 const isRoute = (owner: SessionOwnerScope): owner is SessionProfileRoute =>
   Boolean(owner && typeof owner === 'object' && 'connectionId' in owner)
 
+/**
+ * Contradictory owner evidence (two connections claim the same session, or a
+ * profile projection disagrees with the connection-qualified owner). It is NOT
+ * an unknown owner: unknown falls to ambient/probe, ambiguous must fail closed.
+ */
+export const isAmbiguousSessionOwner = (owner: SessionOwnerScope): owner is AmbiguousSessionOwner =>
+  Boolean(owner && typeof owner === 'object' && 'ambiguous' in owner)
+
 function routeParams(route: SessionProfileRoute, params: Record<string, unknown>): Record<string, unknown> {
   if (!route.targetProfile || !Object.prototype.hasOwnProperty.call(params, 'profile')) {
     return params
@@ -50,6 +69,14 @@ function routeParams(route: SessionProfileRoute, params: Record<string, unknown>
  * fresh draft with no session, or global chrome) routes ambient.
  */
 export function sessionRpcNeedsProfileRoute(ownerProfile: SessionOwnerScope | undefined): boolean {
+  if (isAmbiguousSessionOwner(ownerProfile)) {
+    // Ambiguous is never ambient: falling back to the active gateway is exactly
+    // the misroute the sentinel exists to prevent. It is not routable either —
+    // `requestForSessionProfile` rejects it before any dispatch — so this stays
+    // an explicit branch rather than leaning on an object stringifying truthy.
+    return true
+  }
+
   if (isRoute(ownerProfile)) {
     // A descriptor is an immutable ownership claim. Even an explicitly local
     // route must not collapse to the ambient request: another connection can
@@ -79,6 +106,12 @@ export function requestForSessionProfile<T>(
   timeoutMs?: number,
   signal?: AbortSignal
 ): Promise<T> {
+  if (isAmbiguousSessionOwner(ownerProfile)) {
+    // Name the method: an ambiguous owner surfaces to the user as a failed
+    // resume/submit, and "which RPC" is the first thing a report needs.
+    return Promise.reject(new Error(`Session owner is ambiguous; refusing to route session-scoped RPC (${method})`))
+  }
+
   if (isRoute(ownerProfile)) {
     const connectionId = ownerProfile.connectionId.trim()
 

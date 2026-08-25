@@ -2,9 +2,12 @@ import { useEffect } from 'react'
 
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
-import { getSessionOwnerHint } from '@/store/session'
-import { requestForSessionProfile, type SessionOwnerScope } from '@/store/session-request-router'
-import { publishSessionState, sessionTileOwnerRoute, setSessionTileDelegate } from '@/store/session-states'
+import {
+  isAmbiguousSessionOwner,
+  requestForSessionProfile,
+  type SessionOwnerScope
+} from '@/store/session-request-router'
+import { knownOwnerForSession, publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -74,14 +77,23 @@ export function useSessionTileDelegate({
       }
     }
 
-    const ownerForStoredSession = async (storedSessionId: string): Promise<SessionOwnerScope> => {
-      const owner =
-        getSessionOwnerHint(storedSessionId) ??
-        sessionTileOwnerRoute(storedSessionId) ??
-        (await resolveSessionProfile(storedSessionId))
-
-      return owner
-    }
+    /**
+     * The house owner ladder (tile route -> row + open-time hints, reconciled),
+     * then a REST probe only when nothing sync knows.
+     *
+     * Consulting `knownOwnerForSession` rather than the hint alone is what
+     * covers an ORDINARY session on a secondary connection: its row is
+     * connection-qualified but it has no hint in this window (a reload, or the
+     * other window created it). The probe answers with a bare PROFILE name,
+     * which routes to the primary — for such a session that is the misroute
+     * itself, so row evidence has to be tried first.
+     *
+     * Contradictory evidence propagates as the ambiguous sentinel and fails the
+     * RPC closed; the tile surfaces that as a retryable resume error rather
+     * than silently resuming against a backend that never owned the session.
+     */
+    const ownerForStoredSession = async (storedSessionId: string): Promise<SessionOwnerScope> =>
+      knownOwnerForSession(storedSessionId) ?? (await resolveSessionProfile(storedSessionId))
 
     const requestForStoredSession = async <T>(
       storedSessionId: string,
@@ -169,6 +181,15 @@ export function useSessionTileDelegate({
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
         const owner = await ownerForStoredSession(storedSessionId)
+
+        // Contradictory owner evidence: refuse the resume here rather than
+        // letting it flow on. The REST prefetch below reads connectionId/profile
+        // straight off the owner, so an unresolved sentinel would fetch on a
+        // half-built scope — and the paired resume RPC would be rejected by the
+        // router anyway. The tile shows this as its retryable resume error.
+        if (isAmbiguousSessionOwner(owner)) {
+          throw new Error(`Session owner is ambiguous; refusing to resume ${storedSessionId}`)
+        }
 
         const restScope =
           owner && typeof owner === 'object'

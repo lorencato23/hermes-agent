@@ -22,12 +22,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { $clarifyRequests } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
-import {
-  activeGatewayConnectionId,
-  openGatewayForAgent,
-  openGatewayForProfile,
-  requestGatewayForAgent
-} from '@/store/gateway'
+import { activeGatewayConnectionId, openGatewayForAgent, openGatewayForProfile } from '@/store/gateway'
 import { $gatewaySwitching } from '@/store/gateway-switch'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
@@ -174,7 +169,23 @@ interface SessionActionsOptions {
 // (NOT in this set) still legitimately drops to a draft.
 const createdThisRun = new Set<string>()
 
-function currentSessionOwnerRoute(capturedRoute?: SessionProfileRoute | null): SessionProfileRoute | undefined {
+/**
+ * FREEZE the owner an about-to-be-created session belongs to, before the profile
+ * handshake yields. An explicit agent route (the draft's own) wins; otherwise
+ * the ordinary draft is owned by the connection currently serving it.
+ *
+ * `$newChatProfile` is preferred over `$activeGatewayProfile` because a profile
+ * pick sets it SYNCHRONOUSLY while the gateway swap runs in the background —
+ * reading the active profile mid-swap stamps the session with the profile the
+ * user just left. Both halves come from the same active source (the pick is
+ * routed through `activeGatewayConnectionId()` too), so the pair can never
+ * cross-wire a profile onto a connection that does not serve it.
+ *
+ * A null connection id means the PRIMARY gateway is live, which is the legacy
+ * ambient path: no route, no pinning, unchanged behaviour for everyone who
+ * never opens a secondary connection.
+ */
+function captureNewSessionOwner(capturedRoute?: SessionProfileRoute | null): SessionProfileRoute | undefined {
   if (capturedRoute) {
     return { ...capturedRoute }
   }
@@ -187,8 +198,22 @@ function currentSessionOwnerRoute(capturedRoute?: SessionProfileRoute | null): S
 
   return {
     connectionId,
-    profile: normalizeProfileKey($activeGatewayProfile.get())
+    profile: normalizeProfileKey($newChatProfile.get() || $activeGatewayProfile.get())
   }
+}
+
+/**
+ * Every RPC that belongs to a session being created — the create itself, the
+ * close-on-drift, the YOLO follow-up — must ride the SAME frozen owner. Binding
+ * them to one requester is what stops a mid-create gateway swap from sending
+ * the follow-ups to a backend that never held the session.
+ */
+function newSessionRequester(
+  ownerRoute: SessionProfileRoute | undefined,
+  ambientRequest: <R>(method: string, params?: Record<string, unknown>) => Promise<R>
+) {
+  return <T>(method: string, params: Record<string, unknown> = {}): Promise<T> =>
+    requestForSessionProfile<T>(ownerRoute, ambientRequest, method, params)
 }
 
 // Reflect a stored row's persisted token counts into the live usage atom
@@ -236,7 +261,7 @@ function reconcileAuthoritativeMessages(
 // never the profile default (that lives in Settings → Model).
 async function desktopSessionCreateParams(
   cwd: string,
-  capturedRoute = $newChatRoute.get()
+  ownerRoute: SessionProfileRoute | undefined
 ): Promise<Record<string, unknown>> {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
@@ -249,10 +274,12 @@ async function desktopSessionCreateParams(
     provider: $currentProvider.get().trim()
   }
 
-  const profile = capturedRoute?.profile || $newChatProfile.get() || normalizeProfileKey($activeGatewayProfile.get())
+  // The frozen owner already resolved the profile against the same atoms; only
+  // the ownerless (primary gateway) path still has to read them here.
+  const profile = ownerRoute?.profile || normalizeProfileKey($newChatProfile.get() || $activeGatewayProfile.get())
 
-  if (capturedRoute) {
-    await ensureGatewayAgent(capturedRoute.connectionId, profile)
+  if (ownerRoute) {
+    await ensureGatewayAgent(ownerRoute.connectionId, profile)
   } else {
     await ensureGatewayProfile(profile)
   }
@@ -261,7 +288,7 @@ async function desktopSessionCreateParams(
     cols: 96,
     source: 'desktop',
     ...(cwd && { cwd }),
-    ...(profile ? { profile: capturedRoute?.targetProfile || profile } : {}),
+    ...(profile ? { profile: ownerRoute?.targetProfile || profile } : {}),
     ...(selection.model
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
@@ -493,16 +520,13 @@ export function useSessionActions({
               : $currentCwd.get().trim() || resolveNewSessionCwd()
 
         const capturedRoute = $newChatRoute.get()
-        const params = await desktopSessionCreateParams(cwd, capturedRoute)
+        const ownerRoute = captureNewSessionOwner(capturedRoute)
 
-        const created = capturedRoute
-          ? await requestGatewayForAgent<SessionCreateResponse>(
-              capturedRoute.connectionId,
-              capturedRoute.profile,
-              'session.create',
-              params
-            )
-          : await requestGateway<SessionCreateResponse>('session.create', params)
+        const requestForNewSession = newSessionRequester(ownerRoute, requestGateway)
+
+        const params = await desktopSessionCreateParams(cwd, ownerRoute)
+
+        const created = await requestForNewSession<SessionCreateResponse>('session.create', params)
 
         const stored = created.stored_session_id ?? null
 
@@ -524,12 +548,10 @@ export function useSessionActions({
 
         if (drift) {
           console.warn('[submit-drift-abort]', drift, { phase: 'mid-create' })
-          await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          await requestForNewSession('session.close', { session_id: created.session_id }).catch(() => undefined)
 
           return null
         }
-
-        const ownerRoute = currentSessionOwnerRoute(capturedRoute)
 
         if (ownerRoute) {
           setSessionOwnerHint(created.session_id, ownerRoute)
@@ -550,7 +572,7 @@ export function useSessionActions({
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
           // server later returns its own preview/title and supersedes this.
-          upsertOptimisticSession(created, stored, null, preview?.trim() || null)
+          upsertOptimisticSession(created, stored, { ownerRoute, preview: preview?.trim() || null })
           navigate(sessionRoute(stored), { replace: true })
           // Other windows (e.g. the main window when this is the pop-out) can't
           // see this session until they re-pull the shared list.
@@ -572,7 +594,7 @@ export function useSessionActions({
         // User may have armed YOLO on the new-chat draft before the runtime
         // session existed — apply it to the freshly created session.
         if (yoloArmed) {
-          await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
+          await setSessionYolo(requestForNewSession, created.session_id, true).catch(() => undefined)
         }
 
         return created.session_id
@@ -641,43 +663,31 @@ export function useSessionActions({
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
         const capturedRoute = options?.route === undefined ? $newChatRoute.get() : options.route
+        const ownerRoute = captureNewSessionOwner(capturedRoute)
+
+        const requestForNewSession = newSessionRequester(ownerRoute, requestGateway)
         const workspaceScope = options?.workspaceScope ?? { workspaceMode: 'sessions' }
 
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
 
         const params = {
-          ...(await desktopSessionCreateParams(cwd, capturedRoute)),
+          ...(await desktopSessionCreateParams(cwd, ownerRoute)),
           ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
         }
 
-        const created = capturedRoute
-          ? await requestGatewayForAgent<SessionCreateResponse>(
-              capturedRoute.connectionId,
-              capturedRoute.profile,
-              'session.create',
-              params
-            )
-          : await requestGateway<SessionCreateResponse>('session.create', params)
+        const created = await requestForNewSession<SessionCreateResponse>('session.create', params)
 
         const stored = created.stored_session_id
 
         if (!stored) {
-          const closeCreated = capturedRoute
-            ? requestGatewayForAgent(capturedRoute.connectionId, capturedRoute.profile, 'session.close', {
-                session_id: created.session_id
-              })
-            : requestGateway('session.close', { session_id: created.session_id })
-
-          await closeCreated.catch(() => undefined)
+          await requestForNewSession('session.close', { session_id: created.session_id }).catch(() => undefined)
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
 
           return
         }
 
         createdThisRun.add(stored)
-
-        const ownerRoute = currentSessionOwnerRoute(capturedRoute)
 
         if (ownerRoute) {
           setSessionOwnerHint(created.session_id, ownerRoute)
@@ -689,7 +699,7 @@ export function useSessionActions({
         // unlisted (draft) tab stays out of the session list until its first
         // turn persists and a refresh surfaces it.
         if (listed) {
-          upsertOptimisticSession(created, stored, null, null)
+          upsertOptimisticSession(created, stored, { ownerRoute })
         }
 
         // A tile lives in its OWN worktree, so it must not run the full
@@ -1779,14 +1789,12 @@ export function useSessionActions({
           : 0
 
         setFreshDraftReady(false)
-        upsertOptimisticSession(
-          branched,
-          routedSessionId,
-          copy.branchTitle(siblings + 1).toLowerCase(),
+        upsertOptimisticSession(branched, routedSessionId, {
+          lastActive: parent ? parent.last_active || parent.started_at : undefined,
+          parentSessionId: parentStoredId,
           preview,
-          parentStoredId,
-          parent ? parent.last_active || parent.started_at : undefined
-        )
+          title: copy.branchTitle(siblings + 1).toLowerCase()
+        })
         ensureSessionState(branched.session_id, routedSessionId)
         updateSessionState(
           branched.session_id,

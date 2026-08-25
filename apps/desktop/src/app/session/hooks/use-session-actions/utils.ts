@@ -24,6 +24,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setSessionOwnerHint,
   setSessions,
   setWorkspaceCwdOwner,
   setYoloActive
@@ -1237,25 +1238,44 @@ export function selectBranchMessages(
   return toBranchMessages(authoritativeMessages.slice(0, authoritativeIndex + 1))
 }
 
+export interface OptimisticSessionFields {
+  /** Recency the row sorts by; defaults to now (a branch inherits its parent's). */
+  lastActive?: number
+  /**
+   * The connection + profile the session was just created on. Stamping it onto
+   * the row (and recording the matching owner hint) is what keeps an ordinary
+   * session on a SECONDARY connection routable before the cross-profile
+   * aggregator re-fetches: without it the row projects as a bare profile name
+   * and its session-scoped RPCs collapse onto the primary.
+   */
+  ownerRoute?: SessionProfileRoute | null
+  parentSessionId?: string | null
+  preview?: string | null
+  title?: string | null
+}
+
 export function upsertOptimisticSession(
   created: SessionCreateResponse,
   id: string,
-  title: string | null = null,
-  preview: string | null = null,
-  parentSessionId: string | null = null,
-  lastActive?: number
+  { lastActive, ownerRoute, parentSessionId = null, preview = null, title = null }: OptimisticSessionFields = {}
 ) {
   const now = lastActive ?? Date.now() / 1000
-  // Stamp the profile the session was just created on (= the live gateway's
-  // profile) so the scoped sidebar shows the new row immediately instead of
-  // filtering it out as "default" until the aggregator re-fetches.
-  const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  // Stamp the profile the session was just created on (= the owner captured at
+  // create time, else the live gateway's) so the scoped sidebar shows the new
+  // row immediately instead of filtering it out as "default" until the
+  // aggregator re-fetches.
+  const profileKey = normalizeProfileKey(ownerRoute?.profile ?? $activeGatewayProfile.get())
+
+  if (ownerRoute) {
+    setSessionOwnerHint(id, ownerRoute)
+  }
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
     // lane immediately (the overlay groups by path); fall back to the workspace
     // the session was just started in when the create response omits it.
     cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
+    ...(ownerRoute ? { connection_id: ownerRoute.connectionId } : {}),
     ended_at: null,
     id,
     input_tokens: 0,

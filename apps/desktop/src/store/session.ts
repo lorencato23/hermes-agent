@@ -10,7 +10,7 @@ import { persistBoolean, persistString, storedBoolean, storedString } from '@/li
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
 
-import type { SessionProfileRoute } from './session-request-router'
+import { AMBIGUOUS_SESSION_OWNER, type SessionOwnerScope, type SessionProfileRoute } from './session-request-router'
 import { clearUnreadOnOpen } from './session-unread-remote'
 
 type Updater<T> = T | ((current: T) => T)
@@ -142,37 +142,124 @@ export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId:
 }
 
 /**
+ * Owner evidence is compared on the (connection, profile) pair. Grouping is by
+ * CONNECTION, because one connection can legitimately describe the same session
+ * under two profile names: a routed agent's `profile` is the key on the local
+ * connection registry, while `targetProfile` is the name the remote backend
+ * stores — and the cross-profile aggregator tags the row with the BACKEND's
+ * name. Comparing those two projections as strings would report a contradiction
+ * for the exact routed sessions this resolver exists to protect.
+ */
+function ownerAnswersToProfile(owner: SessionProfileRoute, profile: string): boolean {
+  return profile === owner.profile || profile === owner.targetProfile
+}
+
+function ownerRoutesAgree(a: SessionProfileRoute, b: SessionProfileRoute): boolean {
+  return ownerAnswersToProfile(a, b.profile) || ownerAnswersToProfile(b, a.profile)
+}
+
+/**
  * Resolve the strongest owner identity available for a session. A connection-
  * scoped row or open-time hint must stay a route object; reducing it to a bare
  * profile name sends same-named sessions to the primary connection.
+ *
+ * Every sync source is reconciled rather than ranked: the open-time hints (the
+ * only source a hidden/unlisted session has) plus every row that projects this
+ * session id. Compatible evidence collapses onto the richest claim; genuinely
+ * CONTRADICTORY evidence returns the ambiguous sentinel so the caller fails
+ * closed. Guessing between two connections is how a session-scoped RPC lands on
+ * a backend that never owned the session.
+ *
+ * Runs for every session-scoped RPC dispatch, so it walks `sessions` once with
+ * no per-row allocation and returns as soon as a contradiction is proven.
  */
-export function knownSessionOwner(
-  sessions: readonly SessionInfo[],
-  sessionId: null | string
-): SessionProfileRoute | string | undefined {
+export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: null | string): SessionOwnerScope {
   if (!sessionId) {
     return undefined
   }
 
-  const row = sessions.find(session => sessionMatchesStoredId(session, sessionId))
-  const rowProfile = row?.profile?.trim()
-  const rowConnection = row?.connection_id?.trim()
+  // Keyed by connection id: at most one owner claim per connection survives.
+  const qualifiedOwners = new Map<string, SessionProfileRoute>()
+  const profileOnlyOwners = new Set<string>()
 
-  if (rowConnection) {
-    return {
-      connectionId: rowConnection,
-      ...(row?.source === 'local' ? { mode: 'local' as const } : {}),
-      profile: rowProfile || 'default'
+  for (const hint of getSessionOwnerHints(sessionId)) {
+    const known = qualifiedOwners.get(hint.connectionId)
+
+    if (known && !ownerRoutesAgree(known, hint)) {
+      return AMBIGUOUS_SESSION_OWNER
     }
+
+    // Hints arrive oldest-first, so the most recent claim for a connection wins
+    // among compatible ones — it carries the freshest mode/targetProfile.
+    qualifiedOwners.set(hint.connectionId, hint)
   }
 
-  const hint = getSessionOwnerHint(sessionId)
+  for (const row of sessions) {
+    if (!sessionMatchesStoredId(row, sessionId)) {
+      continue
+    }
 
-  if (hint) {
-    return hint
+    const profile = row.profile?.trim()
+
+    // A connection without a profile is incomplete evidence. In particular,
+    // do not invent "default": that could turn an unrelated projection into
+    // a routable owner claim on the wrong backend.
+    if (!profile) {
+      continue
+    }
+
+    const connectionId = row.connection_id?.trim()
+
+    if (!connectionId) {
+      profileOnlyOwners.add(profile)
+
+      continue
+    }
+
+    const known = qualifiedOwners.get(connectionId)
+
+    if (known) {
+      if (!ownerRoutesAgree(known, { connectionId, profile })) {
+        return AMBIGUOUS_SESSION_OWNER
+      }
+
+      // A hint (or an earlier row) already holds this connection with at least
+      // as much detail — a row projection has no mode/targetProfile to add.
+      continue
+    }
+
+    if (qualifiedOwners.size > 0) {
+      return AMBIGUOUS_SESSION_OWNER
+    }
+
+    qualifiedOwners.set(connectionId, {
+      connectionId,
+      ...(row.source === 'local' ? { mode: 'local' as const } : {}),
+      profile
+    })
   }
 
-  return rowProfile || undefined
+  if (qualifiedOwners.size > 1) {
+    return AMBIGUOUS_SESSION_OWNER
+  }
+
+  const owner = qualifiedOwners.values().next().value
+
+  if (owner) {
+    for (const profile of profileOnlyOwners) {
+      if (!ownerAnswersToProfile(owner, profile)) {
+        return AMBIGUOUS_SESSION_OWNER
+      }
+    }
+
+    return owner
+  }
+
+  if (profileOnlyOwners.size === 0) {
+    return undefined
+  }
+
+  return profileOnlyOwners.size === 1 ? profileOnlyOwners.values().next().value : AMBIGUOUS_SESSION_OWNER
 }
 
 /**
@@ -698,8 +785,19 @@ export function setSessionOwnerHint(sessionId: string, route: SessionProfileRout
 
 export function getSessionOwnerHints(sessionId: string): SessionProfileRoute[] {
   const id = sessionId.trim()
+  const matches: SessionProfileRoute[] = []
 
-  return [...sessionOwnerHints.values()].filter(entry => entry.id === id).map(entry => ({ ...entry.route }))
+  // Walked on every session-scoped RPC (knownSessionOwner). Iterate the map
+  // directly instead of spreading all SESSION_OWNER_HINT_LIMIT entries into an
+  // array first — a session has at most a handful of owner claims, and the
+  // copies are the whole cost here.
+  for (const entry of sessionOwnerHints.values()) {
+    if (entry.id === id) {
+      matches.push({ ...entry.route })
+    }
+  }
+
+  return matches
 }
 
 export function getSessionOwnerHint(

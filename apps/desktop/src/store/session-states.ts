@@ -806,19 +806,30 @@ export function storedSessionIdForRuntimeId(sessionId: string): null | string {
   return null
 }
 
+/** Owner routes are compared FIELD BY FIELD (never by reference): every field is
+ *  load-bearing for routing, and `mode` decides local-vs-remote dial — omitting
+ *  it from the comparison silently kept a stale route on a re-scope. */
+const sameOwnerRoute = (a: SessionProfileRoute | undefined, b: SessionProfileRoute | undefined): boolean =>
+  a?.connectionId === b?.connectionId &&
+  a?.mode === b?.mode &&
+  a?.profile === b?.profile &&
+  a?.targetProfile === b?.targetProfile
+
 export function setSessionTileWorkspaceScope(storedSessionId: string, scope: SessionTileWorkspaceScope): boolean {
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.ownerRoute
+  // A re-scope that names no owner must KEEP the tile's own: an ordinary tile
+  // re-docked (drag, ⌘W shuffle, "open in workspace") passes a plain
+  // `{ workspaceMode }` scope, and dropping the route there is what reduced the
+  // tile back to a bare profile and re-pointed its resume at the primary.
+  const ownerRoute = scope.ownerRoute ?? tile?.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
     !tile ||
     ((tile.workspaceMode ?? 'sessions') === scope.workspaceMode &&
       tile.workspaceOwnerKey === workspaceOwnerKey &&
-      tile.ownerRoute?.connectionId === ownerRoute?.connectionId &&
-      tile.ownerRoute?.profile === ownerRoute?.profile &&
-      tile.ownerRoute?.targetProfile === ownerRoute?.targetProfile &&
+      sameOwnerRoute(tile.ownerRoute, ownerRoute) &&
       tile.workspaceTabTitle === workspaceTabTitle)
   ) {
     return false
@@ -1064,7 +1075,10 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        // Not bots-only: an ORDINARY session on a secondary connection needs the
+        // exact route persisted too, or its tile resumes against the primary
+        // after a relaunch/profile swap.
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,
@@ -1276,6 +1290,7 @@ export function reopenLastClosedTile(): void {
 
     if (!$sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
       openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before, {
+        ownerRoute: tile.ownerRoute,
         workspaceMode: tile.workspaceMode ?? 'sessions',
         workspaceOwnerKey: tile.workspaceOwnerKey
       })

@@ -18,8 +18,14 @@ import {
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
-import { requestGatewayForAgent } from '@/store/gateway'
-import { $activeGatewayProfile, $newChatProfile, $newChatRoute, ensureGatewayProfile } from '@/store/profile'
+import { activeGatewayConnectionId, requestGatewayForAgent } from '@/store/gateway'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $newChatRoute,
+  ensureGatewayAgent,
+  ensureGatewayProfile
+} from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
@@ -33,7 +39,9 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   $turnStartedAt,
+  knownSessionOwner,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
@@ -80,6 +88,7 @@ vi.mock('@/store/profile', async importOriginal => ({
 
 vi.mock('@/store/gateway', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  activeGatewayConnectionId: vi.fn(() => null),
   requestGatewayForAgent: vi.fn()
 }))
 
@@ -536,6 +545,7 @@ describe('createBackendSessionForSend profile routing', () => {
     cleanup()
     $newChatProfile.set(null)
     $newChatRoute.set(null)
+    vi.mocked(activeGatewayConnectionId).mockReturnValue(null)
     $activeGatewayProfile.set('default')
     $projectScope.set(ALL_PROJECTS)
     $projectTree.set([])
@@ -545,6 +555,8 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentProvider.set('')
     $currentReasoningEffort.set('')
     setNewChatWorkspaceTarget(undefined)
+    setSessions([])
+    vi.clearAllMocks()
     vi.restoreAllMocks()
   })
 
@@ -626,6 +638,55 @@ describe('createBackendSessionForSend profile routing', () => {
       expect.objectContaining({ profile: 'backend-default', source: 'desktop' })
     )
     expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
+  })
+
+  it('captures an ordinary secondary owner before create and stamps the optimistic row', async () => {
+    const ready = deferred<void>()
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    vi.mocked(activeGatewayConnectionId).mockReturnValue('remote-source')
+    vi.mocked(ensureGatewayAgent).mockReturnValueOnce(ready.promise)
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({
+      session_id: RUNTIME_SESSION_ID,
+      stored_session_id: 'stored-remote'
+    } as never)
+    $activeGatewayProfile.set('default')
+    $newChatProfile.set('writer')
+    $newChatRoute.set(null)
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let createPromise!: Promise<null | string>
+    act(() => {
+      createPromise = handle!.createBackendSessionForSend('remote preview')
+    })
+    await waitFor(() => expect(ensureGatewayAgent).toHaveBeenCalledWith('remote-source', 'writer'))
+
+    vi.mocked(activeGatewayConnectionId).mockReturnValue('other-source')
+    $activeGatewayProfile.set('other-profile')
+    ready.resolve()
+
+    await act(async () => {
+      await createPromise
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'remote-source',
+      'writer',
+      'session.create',
+      expect.objectContaining({ profile: 'writer', source: 'desktop' })
+    )
+    expect($sessions.get().find(session => session.id === 'stored-remote')).toMatchObject({
+      connection_id: 'remote-source',
+      profile: 'writer'
+    })
+    expect(knownSessionOwner($sessions.get(), 'stored-remote')).toEqual({
+      connectionId: 'remote-source',
+      profile: 'writer'
+    })
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {

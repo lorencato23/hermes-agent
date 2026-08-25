@@ -8,9 +8,12 @@ import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentBranch,
   $currentCwd,
+  $sessions,
+  getSessionOwnerHint,
   setCurrentBranch,
   setCurrentCwd,
   setSelectedStoredSessionId,
+  setSessions,
   workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
 import type { SessionInfo, SessionResumeResponse } from '@/types/hermes'
@@ -33,8 +36,33 @@ import {
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
-  toBranchMessages
+  toBranchMessages,
+  upsertOptimisticSession
 } from './utils'
+
+describe('upsertOptimisticSession ownership', () => {
+  afterEach(() => setSessions([]))
+
+  it('stamps the captured profile and connection while recording its owner hint', () => {
+    const owner = {
+      connectionId: 'remote-source',
+      mode: 'remote' as const,
+      profile: 'writer',
+      targetProfile: 'backend-writer'
+    }
+
+    upsertOptimisticSession({ session_id: 'runtime-owner', stored_session_id: 'stored-owner' }, 'stored-owner', {
+      ownerRoute: owner
+    })
+
+    expect($sessions.get()[0]).toMatchObject({
+      connection_id: 'remote-source',
+      id: 'stored-owner',
+      profile: 'writer'
+    })
+    expect(getSessionOwnerHint('stored-owner')).toEqual(owner)
+  })
+})
 
 const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
   ({ id, role, parts: [{ type: 'text', text }], ...extra }) as ChatMessage

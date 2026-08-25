@@ -88,8 +88,7 @@ export function listTileSessionRow(deps: {
   upsertOptimisticSession(
     { info: { cwd: deps.cwd, model: deps.model }, session_id: deps.runtimeId, stored_session_id: deps.storedSessionId },
     deps.storedSessionId,
-    null,
-    preview
+    { preview }
   )
   broadcastSessionsChanged()
 

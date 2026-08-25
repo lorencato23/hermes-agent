@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { requestGatewayForAgent } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $selectedStoredSessionId, setSessions } from '@/store/session'
 import type { SessionTile } from '@/store/session-states'
@@ -27,6 +28,11 @@ import {
   setSessionTileDelegate,
   setSessionTileWorkspaceScope
 } from '@/store/session-states'
+
+vi.mock('@/store/gateway', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  requestGatewayForAgent: vi.fn()
+}))
 
 const tile = (storedSessionId: string): SessionTile => ({ storedSessionId })
 const tilePane = (id: string) => `session-tile:${id}`
@@ -245,6 +251,15 @@ describe('SessionTile workspace scope', () => {
     })
   })
 
+  it('keeps an ordinary remote tile owner when an existing tile is re-opened or re-scoped', () => {
+    const ownerRoute = { connectionId: 'remote-source', mode: 'remote' as const, profile: 'writer' }
+
+    openSessionTile('remote-chat', 'right', undefined, undefined, { ownerRoute, workspaceMode: 'sessions' })
+    openSessionTile('remote-chat', 'left', 'workspace')
+
+    expect($sessionTiles.get()[0]).toMatchObject({ ownerRoute, storedSessionId: 'remote-chat' })
+  })
+
   it('preserves workspace scope while dropping a stale runtime binding', () => {
     $sessionTiles.set([
       {
@@ -459,6 +474,7 @@ describe('blankDraftTile', () => {
 describe('reopenLastClosedTile focuses the restored tab', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    vi.mocked(requestGatewayForAgent).mockReset()
     vi.resetModules()
   })
 
@@ -539,6 +555,30 @@ describe('reopenLastClosedTile focuses the restored tab', () => {
     expect(states.$sessionTiles.get().some(t => t.storedSessionId === 'closed')).toBe(true)
     expect(findGroupOfPane(tree.$layoutTree.get()!, tilePane('closed'))?.active).toBe(tilePane('closed'))
     expect(tree.$activeTreeGroup.get()).toBe('grp-main')
+  })
+
+  it('restores an ordinary remote owner route and uses it after close/reopen', async () => {
+    const { states } = await setup()
+    const ownerRoute = { connectionId: 'remote-source', profile: 'writer' }
+    const ambientRequest = vi.fn()
+
+    states.openSessionTile('ordinary-remote', 'center', 'workspace', undefined, {
+      ownerRoute,
+      workspaceMode: 'sessions'
+    })
+    states.closeSessionTile('ordinary-remote')
+    states.reopenLastClosedTile()
+
+    expect(states.sessionTileOwnerRoute('ordinary-remote')).toEqual(ownerRoute)
+
+    await states.requestForOwnedSession('ordinary-remote', ambientRequest, 'session.resume', {
+      session_id: 'ordinary-remote'
+    })
+
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('remote-source', 'writer', 'session.resume', {
+      session_id: 'ordinary-remote'
+    })
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 })
 

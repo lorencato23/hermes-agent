@@ -53,7 +53,8 @@ const {
   setPrimaryGateway
 } = await import('./gateway')
 
-const { requestForSessionProfile, sessionRpcNeedsProfileRoute } = await import('./session-request-router')
+const { AMBIGUOUS_SESSION_OWNER, isAmbiguousSessionOwner, requestForSessionProfile, sessionRpcNeedsProfileRoute } =
+  await import('./session-request-router')
 
 function installDesktop(): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
@@ -149,9 +150,34 @@ describe('sessionRpcNeedsProfileRoute', () => {
     expect(sessionRpcNeedsProfileRoute({ connectionId: 'local', profile: 'developer' })).toBe(true)
     expect(sessionRpcNeedsProfileRoute({ connectionId: '', profile: 'developer' })).toBe(false)
   })
+
+  // Ambiguous must never read as "unknown": unknown is the one scope allowed to
+  // fall to the ambient dispatcher, which is precisely the misroute the
+  // sentinel exists to prevent. It stays non-ambient here on an explicit
+  // branch, and requestForSessionProfile rejects it before any dispatch.
+  it('never routes an ambiguous owner ambient', () => {
+    expect(sessionRpcNeedsProfileRoute(AMBIGUOUS_SESSION_OWNER)).toBe(true)
+    expect(isAmbiguousSessionOwner(AMBIGUOUS_SESSION_OWNER)).toBe(true)
+    expect(isAmbiguousSessionOwner({ connectionId: 'local', profile: 'developer' })).toBe(false)
+    expect(isAmbiguousSessionOwner('developer')).toBe(false)
+    expect(isAmbiguousSessionOwner(undefined)).toBe(false)
+  })
 })
 
 describe('requestForSessionProfile', () => {
+  it('rejects an ambiguous owner before ambient, agent, or profile routing', async () => {
+    const ambient = vi.fn(async () => ({ ambient: true }))
+
+    await expect(
+      requestForSessionProfile({ ambiguous: true }, ambient as never, 'session.resume', {
+        session_id: 'contradictory-owner'
+      })
+    ).rejects.toThrow('Session owner is ambiguous; refusing to route session-scoped RPC')
+
+    expect(ambient).not.toHaveBeenCalled()
+    expect(secondaryGateways).toHaveLength(0)
+  })
+
   it('keeps concurrent same-name requests pinned while foreground activation changes', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')

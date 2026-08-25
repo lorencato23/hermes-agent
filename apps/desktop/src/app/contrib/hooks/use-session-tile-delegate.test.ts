@@ -65,6 +65,8 @@ describe('useSessionTileDelegate resumeTile', () => {
   beforeEach(() => {
     setSessions([])
     vi.mocked(getLatestSessionMessages).mockClear()
+    vi.mocked(requestGatewayForAgent).mockReset()
+    vi.mocked(requestGatewayForProfile).mockReset()
   })
 
   afterEach(() => {
@@ -226,6 +228,53 @@ describe('useSessionTileDelegate resumeTile', () => {
     // The next resume goes cold instead of reusing the dead binding.
     const runtimeId = await sessionTileDelegate()!.resumeTile('stored-c')
     expect(runtimeId).toBe('runtime-fresh')
+  })
+
+  // An ORDINARY session created on a secondary connection: the row is
+  // connection-qualified, but this window has no owner hint for it (a reload,
+  // or another window created it) and the tile carries no route. The owner
+  // ladder has to read that row — the REST probe answers with a bare profile
+  // name, which routes to the PRIMARY, i.e. the misroute itself.
+  it('routes an ordinary tile through a connection-qualified ROW with no hint or tile route', async () => {
+    setSessions([row({ connection_id: 'remote-source', id: 'ordinary-remote', profile: 'writer' })])
+
+    vi.mocked(requestGatewayForAgent).mockResolvedValueOnce({ session_id: 'runtime-ordinary' } as never)
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    renderTile(ambientRequest)
+    const runtimeId = await sessionTileDelegate()!.resumeTile('ordinary-remote')
+
+    expect(runtimeId).toBe('runtime-ordinary')
+    expect(requestGatewayForAgent).toHaveBeenCalledWith('remote-source', 'writer', 'session.resume', {
+      session_id: 'ordinary-remote',
+      cols: 96,
+      omit_messages: true,
+      profile: 'writer'
+    })
+    expect(requestGatewayForProfile).not.toHaveBeenCalled()
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
+  // Two connections claim the same id. Resuming on either is a coin flip that
+  // forks the conversation onto a backend that never owned it, so the tile
+  // fails closed instead — and without firing the REST prefetch, whose scope
+  // would otherwise be built from an owner that does not exist.
+  it('refuses a tile resume outright when owner evidence is contradictory', async () => {
+    setSessions([
+      row({ connection_id: 'source-a', id: 'contradicted', profile: 'writer' }),
+      row({ connection_id: 'source-b', id: 'contradicted', profile: 'writer' })
+    ])
+
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    renderTile(ambientRequest)
+
+    await expect(sessionTileDelegate()!.resumeTile('contradicted')).rejects.toThrow('Session owner is ambiguous')
+
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
+    expect(requestGatewayForProfile).not.toHaveBeenCalled()
+    expect(ambientRequest).not.toHaveBeenCalled()
   })
 })
 

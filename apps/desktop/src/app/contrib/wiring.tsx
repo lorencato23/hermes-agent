@@ -72,7 +72,6 @@ import {
   $selectedStoredSessionId,
   $sessionResumeRequest,
   $sessions,
-  knownSessionProfile,
   sessionMatchesStoredId,
   sessionPinId,
   setAwaitingResponse,
@@ -153,7 +152,7 @@ import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
-import { findStoredIdForRuntimeId, resolveRoutingSessionId } from './wiring-routing'
+import { findStoredIdForRuntimeId, resolveKnownSessionRpcOwner, resolveRoutingSessionId } from './wiring-routing'
 
 // Overlay views the controller mounts over the shell — lazy, load on demand.
 // The workspace-route full-page views (skills/messaging/artifacts) are the
@@ -356,16 +355,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           undefined
       })
 
-      let owner: SessionOwnerScope =
-        (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
-        knownSessionProfile($sessions.get(), routingSessionId)
+      let owner: SessionOwnerScope = resolveKnownSessionRpcOwner(
+        $sessions.get(),
+        routingSessionId,
+        routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined
+      )
 
       if (!owner && routingSessionId) {
-        // Unknown owner for a REAL session: probe across profiles (REST, not the
+        // UNKNOWN owner for a REAL session: probe across profiles (REST, not the
         // gateway socket, so no recursion) rather than defaulting to active. A
         // hit stamps ownership + caches a hint; a miss leaves owner undefined
         // and the request falls to ambient, exactly as an unroutable session did
         // before — but only after we tried, never as a silent active fallback.
+        //
+        // AMBIGUOUS is not unknown and deliberately skips this: the probe
+        // answers with a bare profile name, which routes to the primary — the
+        // very guess the contradiction told us we cannot make. It stays
+        // ambiguous and requestForSessionProfile rejects below.
         const probed = await resolveSessionProfile(routingSessionId)
 
         if (probed) {

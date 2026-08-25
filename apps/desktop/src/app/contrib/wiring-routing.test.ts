@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-import { findStoredIdForRuntimeId, resolveRoutingSessionId } from './wiring-routing'
+import { findStoredIdForRuntimeId, resolveKnownSessionRpcOwner, resolveRoutingSessionId } from './wiring-routing'
+
+describe('resolveKnownSessionRpcOwner', () => {
+  it('keeps the production dispatcher pinned to a connection-qualified row owner', () => {
+    expect(
+      resolveKnownSessionRpcOwner(
+        [{ connection_id: 'remote-source', id: 'ordinary-session', profile: 'default' } as never],
+        'ordinary-session'
+      )
+    ).toEqual({ connectionId: 'remote-source', profile: 'default' })
+  })
+})
 
 describe('findStoredIdForRuntimeId', () => {
   it('reverse-resolves a runtime id to its stored id', () => {
