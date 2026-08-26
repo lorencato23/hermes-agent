@@ -79,6 +79,150 @@ class SessionSearchMixin:
             field for field in cls._SEARCH_MESSAGE_RESULT_FIELDS if field in requested
         )
 
+    # ── FTS result SQL assembly ──────────────────────────────────────────
+    #
+    # Every FTS route (unicode61, cjk-bigram, trigram) returns the same row
+    # shape, so the projection lives here once. ``{table}`` is interpolated
+    # by the builder below — it is never caller-supplied, only one of the
+    # three module-controlled index names.
+    _FTS_ROW_PROJECTION = """
+                m.id,
+                m.session_id,
+                m.role,
+                snippet({table}, -1, '>>>', '<<<', '...', 40) AS snippet,
+                m.timestamp,
+                m.tool_name,
+                s.source,
+                s.model,
+                s.started_at AS session_started
+    """
+
+    # The only three orderings any FTS route emits. Held as constants so the
+    # late-hydration decision below is an equality test against a known
+    # string rather than a substring sniff of generated SQL — a new ordering
+    # added here cannot silently fall into the wrong branch.
+    _ORDER_BY_RANK = "ORDER BY rank"
+    _ORDER_BY_NEWEST = "ORDER BY m.timestamp DESC, rank"
+    _ORDER_BY_OLDEST = "ORDER BY m.timestamp ASC, rank"
+
+    @classmethod
+    def _order_needs_late_hydration(cls, order_by_sql: str) -> bool:
+        """True for the one ordering whose snippets are mostly thrown away.
+
+        SQLite's bounded sorter (``ORDER BY ... LIMIT n``) compares a row's
+        sort key BEFORE materialising its record, so a row that cannot make
+        the page never has ``snippet()`` evaluated. Which orderings benefit
+        from that follows entirely from the order rows arrive in — FTS5
+        feeds them out by rowid, i.e. insertion order:
+
+        - ``ORDER BY rank`` never sorts at all; FTS5 stops at LIMIT.
+        - ``ORDER BY m.timestamp ASC`` — incoming rows are older than the
+          page's worst, so the sorter rejects them un-materialised.
+        - ``ORDER BY m.timestamp DESC`` — every incoming row is NEWER than
+          the page's worst, so it wins the comparison and gets materialised,
+          snippet and all. Every match pays, and all but ``limit`` are then
+          discarded.
+
+        Descending is therefore the only pathological case, and it is the
+        one ``sort='newest'`` produces — the recency-shaped recall the
+        session_search tool actively recommends. Measured on a 30k-message
+        corpus: 409 ms descending against 53 ms ascending.
+
+        Note this is worst on a HEALTHY corpus. The cost depends on rows
+        arriving in ascending timestamp order, which is the normal shape;
+        the same query over a corpus whose timestamps do not track insertion
+        order (imports, clock steps — ``get_messages_as_conversation``
+        documents why timestamps are not monotonic) measured 68 ms, because
+        there the sorter rejects rows in both directions.
+        """
+        return order_by_sql == cls._ORDER_BY_NEWEST
+
+    @classmethod
+    def _build_fts_search_sql(
+        cls,
+        *,
+        table: str,
+        where_clauses: List[str],
+        params: list,
+        order_by_sql: str,
+        limit: int,
+        offset: int,
+    ) -> Tuple[str, list]:
+        """Assemble an FTS search statement plus its bound parameters.
+
+        ``params`` must already hold the WHERE bindings in clause order, with
+        the MATCH query first (every call site builds them that way). The
+        returned list appends the pagination — and, on the two-phase form,
+        the repeated MATCH binding — so callers execute it verbatim.
+
+        Two shapes are emitted. The default is the single-phase statement —
+        one MATCH, ``snippet()`` in the SELECT list — which is the cheapest
+        form for every ordering EXCEPT descending timestamp, where the
+        snippet is generated for every match and then discarded for all but
+        one page (see ``_order_needs_late_hydration`` for why the asymmetry
+        falls where it does).
+
+        For that one ordering the statement becomes two-phase: an inner
+        query carrying only the rowid takes the sort and the LIMIT, and the
+        outer query computes ``snippet()`` for the surviving page alone. The
+        outer query repeats the MATCH because FTS5 auxiliary functions are
+        only defined against a matched index, and repeats ``order_by_sql``
+        because a join does not preserve the CTE's row order. Same rows,
+        same order — both phases sort on identical keys.
+
+        The two-phase form is applied ONLY there, and deliberately so: its
+        second MATCH is not free, and on the orderings the bounded sorter
+        already protects it measured 25-75% SLOWER than the single-phase
+        statement. This is a targeted fix, not a general one.
+        """
+        where_sql = " AND ".join(where_clauses)
+        projection = cls._FTS_ROW_PROJECTION.format(table=table)
+
+        if not cls._order_needs_late_hydration(order_by_sql):
+            sql = f"""
+                SELECT{projection}
+                FROM {table}
+                JOIN messages m ON m.id = {table}.rowid
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where_sql}
+                {order_by_sql}
+                LIMIT ? OFFSET ?
+            """
+            return sql, [*params, limit, offset]
+
+        # The inner query joins `sessions` unconditionally, even when no
+        # clause references it. It looks like dead work — it is not. The
+        # inner query decides which rows fill the page, and the outer query
+        # INNER JOINs `sessions` to project `source`/`model`. If the inner
+        # query did not join it too, the two would select from different row
+        # sets: a message whose `sessions` row is missing would take a
+        # LIMIT/OFFSET slot in the CTE and then be dropped by the outer
+        # join, silently shortening the page (or emptying it — 10 rows
+        # became 0 in the case that caught this). The FK makes that state
+        # rare, not impossible: an FK-off migration window or a
+        # partially-restored DB both produce it. Correct pages are worth one
+        # primary-key probe per candidate row.
+        sql = f"""
+            WITH page AS (
+                SELECT {table}.rowid AS rowid
+                FROM {table}
+                JOIN messages m ON m.id = {table}.rowid
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {where_sql}
+                {order_by_sql}
+                LIMIT ? OFFSET ?
+            )
+            SELECT{projection}
+            FROM page
+            JOIN {table} ON {table}.rowid = page.rowid
+            JOIN messages m ON m.id = page.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE {table} MATCH ?
+            {order_by_sql}
+        """
+        # params[0] is the MATCH binding; the outer MATCH re-binds it.
+        return sql, [*params, limit, offset, params[0]]
+
     def _try_incremental_merge_fts(self) -> None:
         """Run one bounded FTS5 merge pass without failing the completed write."""
         if not self._fts_enabled:
@@ -1384,25 +1528,14 @@ class SessionSearchMixin:
         if role_filter:
             tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             tri_params.extend(role_filter)
-        tri_sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet({table}, -1, '>>>', '<<<', '...', 40) AS snippet,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM {table}
-            JOIN messages m ON m.id = {table}.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {' AND '.join(tri_where)}
-            {order_by_sql}
-            LIMIT ? OFFSET ?
-        """
-        tri_params.extend([limit, offset])
+        tri_sql, tri_params = self._build_fts_search_sql(
+            table=table,
+            where_clauses=tri_where,
+            params=tri_params,
+            order_by_sql=order_by_sql,
+            limit=limit,
+            offset=offset,
+        )
         with self._read_ctx() as conn:
             try:
                 tri_cursor = conn.execute(tri_sql, tri_params)
@@ -1788,11 +1921,11 @@ class SessionSearchMixin:
         # ORDER BY shared across the main FTS5 path and trigram CJK path.
         # With sort set, timestamp is primary and rank is the tiebreaker.
         if sort_norm == "newest":
-            order_by_sql = "ORDER BY m.timestamp DESC, rank"
+            order_by_sql = self._ORDER_BY_NEWEST
         elif sort_norm == "oldest":
-            order_by_sql = "ORDER BY m.timestamp ASC, rank"
+            order_by_sql = self._ORDER_BY_OLDEST
         else:
-            order_by_sql = "ORDER BY rank"
+            order_by_sql = self._ORDER_BY_RANK
 
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
@@ -1818,27 +1951,14 @@ class SessionSearchMixin:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
-        where_sql = " AND ".join(where_clauses)
-        params.extend([limit, offset])
-
-        sql = f"""
-            SELECT
-                m.id,
-                m.session_id,
-                m.role,
-                snippet(messages_fts, -1, '>>>', '<<<', '...', 40) AS snippet,
-                m.timestamp,
-                m.tool_name,
-                s.source,
-                s.model,
-                s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE {where_sql}
-            {order_by_sql}
-            LIMIT ? OFFSET ?
-        """
+        sql, params = self._build_fts_search_sql(
+            table="messages_fts",
+            where_clauses=where_clauses,
+            params=params,
+            order_by_sql=order_by_sql,
+            limit=limit,
+            offset=offset,
+        )
 
         # CJK queries bypass the unicode61 FTS5 table.  The default tokenizer
         # splits CJK characters into individual tokens, so "大别山项目" becomes
@@ -1910,25 +2030,14 @@ class SessionSearchMixin:
                 if role_filter:
                     cjk_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     cjk_params.extend(role_filter)
-                cjk_sql = f"""
-                    SELECT
-                        m.id,
-                        m.session_id,
-                        m.role,
-                        snippet(messages_fts_cjk, -1, '>>>', '<<<', '...', 40) AS snippet,
-                        m.timestamp,
-                        m.tool_name,
-                        s.source,
-                        s.model,
-                        s.started_at AS session_started
-                    FROM messages_fts_cjk
-                    JOIN messages m ON m.id = messages_fts_cjk.rowid
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(cjk_where)}
-                    {order_by_sql}
-                    LIMIT ? OFFSET ?
-                """
-                cjk_params.extend([limit, offset])
+                cjk_sql, cjk_params = self._build_fts_search_sql(
+                    table="messages_fts_cjk",
+                    where_clauses=cjk_where,
+                    params=cjk_params,
+                    order_by_sql=order_by_sql,
+                    limit=limit,
+                    offset=offset,
+                )
                 try:
                     with self._read_ctx() as conn:
                         cjk_cursor = conn.execute(cjk_sql, cjk_params)
@@ -1998,25 +2107,14 @@ class SessionSearchMixin:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
-                tri_sql = f"""
-                    SELECT
-                        m.id,
-                        m.session_id,
-                        m.role,
-                        snippet(messages_fts_trigram, -1, '>>>', '<<<', '...', 40) AS snippet,
-                        m.timestamp,
-                        m.tool_name,
-                        s.source,
-                        s.model,
-                        s.started_at AS session_started
-                    FROM messages_fts_trigram
-                    JOIN messages m ON m.id = messages_fts_trigram.rowid
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(tri_where)}
-                    {order_by_sql}
-                    LIMIT ? OFFSET ?
-                """
-                tri_params.extend([limit, offset])
+                tri_sql, tri_params = self._build_fts_search_sql(
+                    table="messages_fts_trigram",
+                    where_clauses=tri_where,
+                    params=tri_params,
+                    order_by_sql=order_by_sql,
+                    limit=limit,
+                    offset=offset,
+                )
                 try:
                     with self._read_ctx() as conn:
                         tri_cursor = conn.execute(tri_sql, tri_params)
