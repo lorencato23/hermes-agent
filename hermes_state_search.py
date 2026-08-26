@@ -97,8 +97,16 @@ class SessionSearchMixin:
                 s.started_at AS session_started
     """
 
-    @staticmethod
-    def _order_needs_late_hydration(order_by_sql: str) -> bool:
+    # The only three orderings any FTS route emits. Held as constants so the
+    # late-hydration decision below is an equality test against a known
+    # string rather than a substring sniff of generated SQL — a new ordering
+    # added here cannot silently fall into the wrong branch.
+    _ORDER_BY_RANK = "ORDER BY rank"
+    _ORDER_BY_NEWEST = "ORDER BY m.timestamp DESC, rank"
+    _ORDER_BY_OLDEST = "ORDER BY m.timestamp ASC, rank"
+
+    @classmethod
+    def _order_needs_late_hydration(cls, order_by_sql: str) -> bool:
         """True for the one ordering whose snippets are mostly thrown away.
 
         SQLite's bounded sorter (``ORDER BY ... LIMIT n``) compares a row's
@@ -127,7 +135,7 @@ class SessionSearchMixin:
         documents why timestamps are not monotonic) measured 68 ms, because
         there the sorter rejects rows in both directions.
         """
-        return "m.timestamp DESC" in order_by_sql
+        return order_by_sql == cls._ORDER_BY_NEWEST
 
     @classmethod
     def _build_fts_search_sql(
@@ -182,21 +190,24 @@ class SessionSearchMixin:
             """
             return sql, [*params, limit, offset]
 
-        # The inner query only needs the tables its own clauses reference.
-        # Skipping the sessions join when no source filter is active spares
-        # one primary-key lookup per match — and the match set is exactly
-        # what this path is trying to stop paying per-row costs on.
-        inner_join_sessions = any("s." in clause for clause in where_clauses)
-        inner_sessions_sql = (
-            "\n                JOIN sessions s ON s.id = m.session_id"
-            if inner_join_sessions
-            else ""
-        )
+        # The inner query joins `sessions` unconditionally, even when no
+        # clause references it. It looks like dead work — it is not. The
+        # inner query decides which rows fill the page, and the outer query
+        # INNER JOINs `sessions` to project `source`/`model`. If the inner
+        # query did not join it too, the two would select from different row
+        # sets: a message whose `sessions` row is missing would take a
+        # LIMIT/OFFSET slot in the CTE and then be dropped by the outer
+        # join, silently shortening the page (or emptying it — 10 rows
+        # became 0 in the case that caught this). The FK makes that state
+        # rare, not impossible: an FK-off migration window or a
+        # partially-restored DB both produce it. Correct pages are worth one
+        # primary-key probe per candidate row.
         sql = f"""
             WITH page AS (
                 SELECT {table}.rowid AS rowid
                 FROM {table}
-                JOIN messages m ON m.id = {table}.rowid{inner_sessions_sql}
+                JOIN messages m ON m.id = {table}.rowid
+                JOIN sessions s ON s.id = m.session_id
                 WHERE {where_sql}
                 {order_by_sql}
                 LIMIT ? OFFSET ?
@@ -1910,11 +1921,11 @@ class SessionSearchMixin:
         # ORDER BY shared across the main FTS5 path and trigram CJK path.
         # With sort set, timestamp is primary and rank is the tiebreaker.
         if sort_norm == "newest":
-            order_by_sql = "ORDER BY m.timestamp DESC, rank"
+            order_by_sql = self._ORDER_BY_NEWEST
         elif sort_norm == "oldest":
-            order_by_sql = "ORDER BY m.timestamp ASC, rank"
+            order_by_sql = self._ORDER_BY_OLDEST
         else:
-            order_by_sql = "ORDER BY rank"
+            order_by_sql = self._ORDER_BY_RANK
 
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
@@ -2096,25 +2107,14 @@ class SessionSearchMixin:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
-                tri_sql = f"""
-                    SELECT
-                        m.id,
-                        m.session_id,
-                        m.role,
-                        snippet(messages_fts_trigram, -1, '>>>', '<<<', '...', 40) AS snippet,
-                        m.timestamp,
-                        m.tool_name,
-                        s.source,
-                        s.model,
-                        s.started_at AS session_started
-                    FROM messages_fts_trigram
-                    JOIN messages m ON m.id = messages_fts_trigram.rowid
-                    JOIN sessions s ON s.id = m.session_id
-                    WHERE {' AND '.join(tri_where)}
-                    {order_by_sql}
-                    LIMIT ? OFFSET ?
-                """
-                tri_params.extend([limit, offset])
+                tri_sql, tri_params = self._build_fts_search_sql(
+                    table="messages_fts_trigram",
+                    where_clauses=tri_where,
+                    params=tri_params,
+                    order_by_sql=order_by_sql,
+                    limit=limit,
+                    offset=offset,
+                )
                 try:
                     with self._read_ctx() as conn:
                         tri_cursor = conn.execute(tri_sql, tri_params)

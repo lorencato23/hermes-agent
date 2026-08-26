@@ -155,28 +155,56 @@ def test_descending_ordering_is_two_phase():
     assert params == ["deploy", 20, 5, "deploy"]
 
 
-def test_inner_query_joins_sessions_only_when_filtered():
-    """The inner query is the per-match hot loop — no join it doesn't need."""
-    unfiltered, _ = build_sql(
-        table="messages_fts",
-        where_clauses=["messages_fts MATCH ?", "(m.active = 1 OR m.compacted = 1)"],
-        params=["deploy"],
-        order_by_sql="ORDER BY m.timestamp DESC, rank",
-        limit=20,
-        offset=0,
-    )
-    inner = unfiltered.split("SELECT\n", 1)[0]
-    assert "JOIN sessions" not in inner
+def test_inner_query_always_joins_sessions():
+    """The inner query must select from the same row set as the outer one.
 
-    filtered, _ = build_sql(
-        table="messages_fts",
-        where_clauses=["messages_fts MATCH ?", "s.source IN (?)"],
-        params=["deploy", "cli"],
-        order_by_sql="ORDER BY m.timestamp DESC, rank",
-        limit=20,
-        offset=0,
-    )
-    assert filtered.count("JOIN sessions") == 2
+    The outer query INNER JOINs `sessions` to project source/model. If the
+    inner query skipped that join, a message whose `sessions` row is missing
+    would consume a LIMIT/OFFSET slot in the CTE and then be dropped by the
+    outer join — a silently short (or empty) page. Both phases join it.
+    """
+    for where in (
+        ["messages_fts MATCH ?", "(m.active = 1 OR m.compacted = 1)"],
+        ["messages_fts MATCH ?", "s.source IN (?)"],
+    ):
+        sql, _ = build_sql(
+            table="messages_fts",
+            where_clauses=where,
+            params=["deploy", "cli"][: len(where)],
+            order_by_sql="ORDER BY m.timestamp DESC, rank",
+            limit=20,
+            offset=0,
+        )
+        assert sql.count("JOIN sessions") == 2, where
+
+
+def test_orphan_message_does_not_shorten_the_page(tmp_path):
+    """A message with no `sessions` row must not eat a slot in the page.
+
+    This is the concrete failure the unconditional inner join prevents: with
+    the join skipped, the orphan filled the CTE's LIMIT and the outer join
+    discarded it, returning 0 rows where 10 were expected.
+    """
+    d = SessionDB(db_path=tmp_path / "state.db")
+    if not d._fts_enabled:
+        pytest.skip("FTS5 unavailable in this SQLite build")
+    try:
+        for idx in ("keep", "orphan"):
+            d.create_session(session_id=idx, source="cli", model="m")
+            for n in range(10):
+                d.append_message(idx, role="user", content=f"deploy step {n}")
+        # Drop the newer session's row with the FK disabled — the state an
+        # FK-off migration window or a partial restore can leave behind.
+        with d._read_ctx() as conn:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("DELETE FROM sessions WHERE id = 'orphan'")
+            conn.commit()
+
+        rows = d.search_messages("deploy", limit=10, sort="newest", fields=RESULT_FIELDS)
+        assert len(rows) == 10, "orphaned rows must not consume page slots"
+        assert {r["session_id"] for r in rows} == {"keep"}
+    finally:
+        d.close()
 
 
 @pytest.mark.parametrize(
