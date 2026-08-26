@@ -359,6 +359,14 @@ class ResponsesApiTransport(ProviderTransport):
     _last_issuer_kind: Optional[str] = None
     _last_issuer_model: Optional[str] = None
 
+    @staticmethod
+    def _wire_model(model: str) -> Optional[str]:
+        """Return the exact model identifier sent to the Responses endpoint."""
+        from agent.model_metadata import strip_codex_context_variant_suffix
+
+        normalized = strip_codex_context_variant_suffix(model)
+        return str(normalized or "").strip() or None
+
     @property
     def api_mode(self) -> str:
         return "codex_responses"
@@ -378,7 +386,7 @@ class ResponsesApiTransport(ProviderTransport):
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
         issuer = self._resolve_issuer_kind(kwargs)
-        issuer_model = str(kwargs.get("model") or "").strip() or None
+        issuer_model = self._wire_model(str(kwargs.get("model") or ""))
         self._last_issuer_kind = issuer
         self._last_issuer_model = issuer_model
         return _chat_messages_to_responses_input(
@@ -486,7 +494,7 @@ class ResponsesApiTransport(ProviderTransport):
         # converter so foreign-issuer reasoning blocks in history are
         # dropped before the API rejects them.
         issuer_kind = self._resolve_issuer_kind(params)
-        issuer_model = str(model or "").strip() or None
+        issuer_model = self._wire_model(model)
         self._last_issuer_kind = issuer_kind
         self._last_issuer_model = issuer_model
 
@@ -578,17 +586,11 @@ class ResponsesApiTransport(ProviderTransport):
         # request is issued (openai==2.24.0).  Reported for the
         # ``openai-codex`` / ``gpt-5.5`` combo on chatgpt.com/backend-api/codex
         # (#32892) when the agent runs without external tools registered.
-        # Function-level import: agent.model_metadata is imported lazily
-        # because provider plugins import this transport during
-        # model_metadata's own module init (circular otherwise).
-        from agent.model_metadata import (
-            strip_codex_context_variant_suffix as _strip_ctx_variant,
-        )
         kwargs = {
             # ``-900k`` large-context picker variants are Hermes-side aliases
             # (gpt-5.6-sol-900k etc.) — the Codex/OpenAI backend only knows
             # the base slug, so strip the suffix before it hits the wire.
-            "model": _strip_ctx_variant(model),
+            "model": self._wire_model(model),
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
                 payload_messages,
